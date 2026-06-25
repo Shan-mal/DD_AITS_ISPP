@@ -49,7 +49,7 @@ class User(Base):
 class Vehicle(Base):
     __tablename__ = "vehicles"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     plate_number = Column(String(20), unique=True, nullable=False, index=True)
     brand = Column(String(100), nullable=True)
     model = Column(String(100), nullable=True)

@@ -11,7 +11,6 @@ def send_expiry_notification(session_id: int):
             return
         user = session.vehicle.owner
         if user and user.email:
-            # Реальная отправка письма
             print(f"Уведомление для {user.email}: время парковки истекает")
     finally:
         db.close()

@@ -40,7 +40,6 @@ def sync_sensor_data():
     db = next(get_db())
     try:
         spots = db.query(ParkingSpot).filter(ParkingSpot.sensor_id.isnot(None)).all()
-        # имитация опроса датчиков
         db.commit()
     finally:
         db.close()

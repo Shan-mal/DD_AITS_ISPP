@@ -50,30 +50,23 @@ class LicensePlateRecognizer:
 
     def _correct_plate_text(self, text: str) -> str:
         """Постобработка: исправление типичных ошибок OCR."""
-        # Приводим к верхнему регистру
         text = text.upper().strip()
-        # Удаляем все, кроме букв и цифр
         text = re.sub(r'[^А-ЯA-Z0-9]', '', text)
-        # Таблица замен (латиница -> кириллица, похожие цифры)
         replacements = {
             'A': 'А', 'B': 'В', 'E': 'Е', 'K': 'К', 'M': 'М', 'H': 'Н',
             'O': 'О', 'P': 'Р', 'C': 'С', 'T': 'Т', 'Y': 'У', 'X': 'Х',
             '0': 'О', '1': '1', '2': '2', '3': '3', '4': '4', '5': '5',
             '6': '6', '7': '7', '8': '8', '9': '9',
             'I': '1', 'L': 'Л', 'Z': '2', 'S': '5', 'G': '6', 'J': '7',
-            'З': '3',  # кириллическая З похожа на тройку, но в номере это цифра
-            'Ч': '4',  # иногда путают
+            'З': '3',
+            'Ч': '4',
             'Б': '6',
             'Ь': '6',
         }
         new_text = ''
         for ch in text:
             new_text += replacements.get(ch, ch)
-        # Пытаемся восстановить стандартный формат: А123БВ77 (1 буква, 3 цифры, 2 буквы, 2-3 цифры)
-        # Если длина 8 или 9, пробуем пересобрать
         if 8 <= len(new_text) <= 9:
-            # Предположим, что первая буква, затем 3 цифры, 2 буквы, остальные цифры
-            # Просто вернём как есть — валидатор проверит
             pass
         return new_text
 
@@ -101,8 +94,6 @@ class LicensePlateRecognizer:
         pattern = r'^[А-Я]\d{3}[А-Я]{2}\d{2,3}$'
         if re.match(pattern, plate):
             return True
-        # Альтернативный вариант для старых номеров или с ошибкой
-        # Просто проверяем, что длина 8-9 и начинается с буквы
         if 8 <= len(plate) <= 9 and plate[0].isalpha():
             return True
         return False
@@ -125,7 +116,6 @@ class LicensePlateRecognizer:
         if plate_text is None:
             return {"success": False, "error": "Текст не распознан"}
 
-        # Улучшенная постобработка уже сделана в recognize_text
         is_valid = self.validate_format(plate_text)
         return {
             "success": True,

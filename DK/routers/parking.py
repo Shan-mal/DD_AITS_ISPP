@@ -5,7 +5,7 @@ from core.database import get_db
 from models.models import User, Vehicle, ParkingSpot, Tariff, ParkingSession, SessionStatus
 from schemas.schemas import StartParkingRequest, ParkingSessionOut
 from dependencies import get_current_user
-from tasks.parking_tasks import check_expiring_sessions  # если нужно ручное планирование
+from tasks.parking_tasks import check_expiring_sessions
 import datetime
 
 router = APIRouter(prefix="/parking", tags=["parking"])
@@ -77,8 +77,5 @@ async def start_parking_session(
     db.commit()
     db.refresh(session)
 
-    # Запуск напоминания (можно отложить или использовать beat)
-    # from tasks.notification_tasks import send_expiry_notification
-    # send_expiry_notification.apply_async(args=[session.id], countdown=600)
 
     return session

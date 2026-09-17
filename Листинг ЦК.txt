@@ -1,0 +1,822 @@
+========================================
+celery_app.py
+========================================
+from celery import Celery
+from celery.schedules import crontab
+import os
+
+def create_celery_app() -> Celery:
+    app = Celery(
+        "parking_system",
+        broker=os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0"),
+        backend=os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/0"),
+        include=[
+            "tasks.parking_tasks",
+            "tasks.report_tasks",
+            "tasks.notification_tasks",
+            "tasks.recognition_tasks"
+        ]
+    )
+
+    app.conf.update(
+        task_serializer="json",
+        accept_content=["json"],
+        result_serializer="json",
+        timezone="Europe/Moscow",
+        enable_utc=True,
+        worker_max_tasks_per_child=1000,
+        task_track_started=True,
+        task_acks_late=True,
+        task_reject_on_worker_lost=True,
+        beat_schedule={
+            "check-expiring-sessions-every-minute": {
+                "task": "tasks.parking_tasks.check_expiring_sessions",
+                "schedule": 60.0,
+                "args": ()
+            },
+            "generate-daily-financial-report": {
+                "task": "tasks.report_tasks.generate_daily_report",
+                "schedule": crontab(hour=2, minute=0),
+                "args": ()
+            },
+            "sync-parking-spot-sensors": {
+                "task": "tasks.parking_tasks.sync_sensor_data",
+                "schedule": crontab(minute="*/5"),
+                "args": ()
+            },
+            "cleanup-stale-sessions": {
+                "task": "tasks.parking_tasks.cleanup_stale_sessions",
+                "schedule": crontab(minute=0, hour="*"),
+                "args": ()
+            },
+        },
+        task_routes={
+            "tasks.report_tasks.*": {"queue": "reports"},
+            "tasks.notification_tasks.*": {"queue": "notifications"},
+            "tasks.parking_tasks.*": {"queue": "default"},
+            "tasks.recognition_tasks.*": {"queue": "recognition"},
+        },
+        worker_concurrency=4,
+    )
+
+    return app
+
+celery_app = create_celery_app()
+
+========================================
+database.py
+========================================
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+DATABASE_URL = "postgresql://parking_user:strongpassword123@localhost:5432/parking_db"
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+========================================
+recognizer.py
+========================================
+import cv2
+import easyocr
+import numpy as np
+import re
+from typing import Optional, Tuple
+
+class LicensePlateRecognizer:
+    def __init__(self, cascade_path: str = "license_plate/haarcascade_russian_plate_number.xml"):
+        self.plate_cascade = cv2.CascadeClassifier(cascade_path)
+        self.reader = easyocr.Reader(['ru', 'en'], gpu=False)
+
+    def detect_plate_region(self, image: np.ndarray) -> Optional[np.ndarray]:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        enhanced = clahe.apply(gray)
+
+        plates = self.plate_cascade.detectMultiScale(
+            enhanced,
+            scaleFactor=1.1,
+            minNeighbors=4,
+            minSize=(60, 20),
+            flags=cv2.CASCADE_SCALE_IMAGE
+        )
+
+        if len(plates) == 0:
+            return None
+
+        plates = sorted(plates, key=lambda r: r[2] * r[3], reverse=True)
+        x, y, w, h = plates[0]
+
+        padding_x = int(w * 0.1)
+        padding_y = int(h * 0.2)
+        x1 = max(0, x - padding_x)
+        y1 = max(0, y - padding_y)
+        x2 = min(image.shape[1], x + w + padding_x)
+        y2 = min(image.shape[0], y + h + padding_y)
+
+        return image[y1:y2, x1:x2]
+
+    def preprocess_for_ocr(self, plate_img: np.ndarray) -> np.ndarray:
+        gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
+        binary = cv2.adaptiveThreshold(
+            gray, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            blockSize=11,
+            C=2
+        )
+        return cv2.fastNlMeansDenoising(binary, h=10)
+
+    def _correct_plate_text(self, text: str) -> str:
+        """Постобработка: исправление типичных ошибок OCR."""
+        text = text.upper().strip()
+        text = re.sub(r'[^А-ЯA-Z0-9]', '', text)
+        replacements = {
+            'A': 'А', 'B': 'В', 'E': 'Е', 'K': 'К', 'M': 'М', 'H': 'Н',
+            'O': 'О', 'P': 'Р', 'C': 'С', 'T': 'Т', 'Y': 'У', 'X': 'Х',
+            '0': 'О', '1': '1', '2': '2', '3': '3', '4': '4', '5': '5',
+            '6': '6', '7': '7', '8': '8', '9': '9',
+            'I': '1', 'L': 'Л', 'Z': '2', 'S': '5', 'G': '6', 'J': '7',
+            'З': '3',
+            'Ч': '4',
+            'Б': '6',
+            'Ь': '6',
+        }
+        new_text = ''
+        for ch in text:
+            new_text += replacements.get(ch, ch)
+        if 8 <= len(new_text) <= 9:
+            pass
+        return new_text
+
+    def recognize_text(self, plate_img: np.ndarray) -> Tuple[Optional[str], float]:
+        results = self.reader.readtext(plate_img, detail=1, paragraph=False)
+        if not results:
+            return None, 0.0
+
+        best_text = ""
+        best_conf = 0.0
+        for (bbox, text, conf) in results:
+            clean_text = re.sub(r'[^А-ЯA-Z0-9]', '', text.upper())
+            if len(clean_text) >= 6 and conf > best_conf:
+                best_text = clean_text
+                best_conf = conf
+
+        if not best_text:
+            return None, 0.0
+
+        corrected = self._correct_plate_text(best_text)
+        return corrected, best_conf
+
+    def validate_format(self, plate: str) -> bool:
+        """Гибкая валидация: допускает 8-9 символов, первая буква, потом цифры и буквы."""
+        pattern = r'^[А-Я]\d{3}[А-Я]{2}\d{2,3}$'
+        if re.match(pattern, plate):
+            return True
+        if 8 <= len(plate) <= 9 and plate[0].isalpha():
+            return True
+        return False
+
+    def run(self, image_path: str) -> dict:
+        image = cv2.imread(image_path)
+        if image is None:
+            return {"success": False, "error": "Не удалось загрузить изображение"}
+
+        plate_roi = self.detect_plate_region(image)
+        if plate_roi is None:
+            return {"success": False, "error": "Номер не обнаружен"}
+
+        processed = self.preprocess_for_ocr(plate_roi)
+        plate_text, confidence = self.recognize_text(processed)
+
+        if plate_text is None:
+            plate_text, confidence = self.recognize_text(plate_roi)
+
+        if plate_text is None:
+            return {"success": False, "error": "Текст не распознан"}
+
+        is_valid = self.validate_format(plate_text)
+        return {
+            "success": True,
+            "plate": plate_text,
+            "confidence": round(float(confidence), 2),
+            "valid_format": is_valid
+        }
+
+========================================
+models.py
+========================================
+from datetime import datetime
+from enum import Enum as PyEnum
+from sqlalchemy import (
+    Column, Integer, String, Boolean, DateTime, Float, ForeignKey, Text, Enum, Index, CheckConstraint
+)
+from sqlalchemy.orm import declarative_base, relationship
+
+Base = declarative_base()
+
+class SessionStatus(str, PyEnum):
+    active = "active"
+    completed = "completed"
+    cancelled = "cancelled"
+
+class TransactionStatus(str, PyEnum):
+    pending = "pending"
+    succeeded = "succeeded"
+    failed = "failed"
+    refunded = "refunded"
+
+class SpotStatus(str, PyEnum):
+    free = "free"
+    occupied = "occupied"
+    reserved = "reserved"
+    maintenance = "maintenance"
+
+class UserRole(str, PyEnum):
+    client = "client"
+    admin = "admin"
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    email = Column(String(255), unique=True, nullable=False, index=True)
+    phone = Column(String(20), unique=True, nullable=True)
+    password_hash = Column(String(255), nullable=False)
+    full_name = Column(String(255), nullable=False)
+    role = Column(Enum(UserRole), default=UserRole.client, nullable=False)
+    benefit_category = Column(String(50), nullable=True)
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    vehicles = relationship("Vehicle", back_populates="owner", lazy="dynamic")
+    payment_methods = relationship("PaymentMethod", back_populates="user", lazy="dynamic")
+    transactions = relationship("Transaction", back_populates="user", lazy="dynamic")
+    audit_logs = relationship("AuditLog", back_populates="user", lazy="dynamic")
+
+class Vehicle(Base):
+    __tablename__ = "vehicles"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    plate_number = Column(String(20), unique=True, nullable=False, index=True)
+    brand = Column(String(100), nullable=True)
+    model = Column(String(100), nullable=True)
+    color = Column(String(50), nullable=True)
+    is_default = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    owner = relationship("User", back_populates="vehicles")
+    parking_sessions = relationship("ParkingSession", back_populates="vehicle", lazy="dynamic")
+
+class ParkingSpot(Base):
+    __tablename__ = "parking_spots"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    section = Column(String(10), nullable=False)
+    spot_number = Column(Integer, nullable=False)
+    status = Column(Enum(SpotStatus), default=SpotStatus.free, nullable=False)
+    sensor_id = Column(String(50), unique=True, nullable=True)
+    floor = Column(Integer, nullable=True)
+    is_handicapped = Column(Boolean, default=False)
+    is_electric = Column(Boolean, default=False)
+    hourly_rate_multiplier = Column(Float, default=1.0)
+
+    __table_args__ = (
+        Index("ix_parking_spots_section_spot", "section", "spot_number", unique=True),
+        CheckConstraint("hourly_rate_multiplier > 0", name="ck_positive_multiplier"),
+    )
+
+    sessions = relationship("ParkingSession", back_populates="spot", lazy="dynamic")
+
+class Tariff(Base):
+    __tablename__ = "tariffs"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(100), nullable=False)
+    description = Column(Text, nullable=True)
+    price_per_minute = Column(Float, nullable=False)
+    max_daily = Column(Float, nullable=True)
+    grace_period_minutes = Column(Integer, default=0)
+    is_active = Column(Boolean, default=True)
+    applicable_role = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    sessions = relationship("ParkingSession", back_populates="tariff", lazy="dynamic")
+
+class ParkingSession(Base):
+    __tablename__ = "parking_sessions"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id"), nullable=False, index=True)
+    spot_id = Column(Integer, ForeignKey("parking_spots.id"), nullable=False)
+    tariff_id = Column(Integer, ForeignKey("tariffs.id"), nullable=False)
+    entry_time = Column(DateTime, default=datetime.utcnow, nullable=False)
+    exit_time = Column(DateTime, nullable=True)
+    status = Column(Enum(SessionStatus), default=SessionStatus.active, nullable=False)
+    total_cost = Column(Float, nullable=True)
+    grace_used = Column(Boolean, default=False)
+
+    vehicle = relationship("Vehicle", back_populates="parking_sessions")
+    spot = relationship("ParkingSpot", back_populates="sessions")
+    tariff = relationship("Tariff", back_populates="sessions")
+    transactions = relationship("Transaction", back_populates="session", lazy="dynamic")
+
+class Transaction(Base):
+    __tablename__ = "transactions"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(Integer, ForeignKey("parking_sessions.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    payment_method_id = Column(Integer, ForeignKey("payment_methods.id"), nullable=True)
+    amount = Column(Float, nullable=False)
+    currency = Column(String(3), default="RUB")
+    status = Column(Enum(TransactionStatus), default=TransactionStatus.pending, nullable=False)
+    external_id = Column(String(255), nullable=True)
+    description = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    session = relationship("ParkingSession", back_populates="transactions")
+    user = relationship("User", back_populates="transactions")
+    payment_method = relationship("PaymentMethod", back_populates="transactions")
+
+class PaymentMethod(Base):
+    __tablename__ = "payment_methods"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    token = Column(String(255), nullable=False)
+    last4 = Column(String(4), nullable=True)
+    card_type = Column(String(20), nullable=True)
+    expires_at = Column(DateTime, nullable=True)
+    is_default = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User", back_populates="payment_methods")
+    transactions = relationship("Transaction", back_populates="payment_method", lazy="dynamic")
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    action = Column(String(100), nullable=False)
+    entity_type = Column(String(50), nullable=True)
+    entity_id = Column(Integer, nullable=True)
+    details = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User", back_populates="audit_logs")
+
+========================================
+auth.py
+========================================
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy.orm import Session
+from core.database import get_db
+from models.models import User, UserRole
+from jose import jwt
+from datetime import datetime, timedelta
+import hashlib
+
+router = APIRouter(prefix="/auth", tags=["auth"])
+
+SECRET_KEY = "SECRET_KEY"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+def hash_password(password: str) -> str:
+    """Простое хеширование через SHA-256 (только для разработки)."""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+@router.post("/register")
+def register(email: str, password: str, full_name: str, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == email).first()
+    if user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    hashed = hash_password(password)
+    db_user = User(email=email, password_hash=hashed, full_name=full_name)
+    db.add(db_user)
+    db.commit()
+    return {"msg": "User created"}
+
+@router.post("/token")
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == form_data.username).first()
+    if not user or user.password_hash != hash_password(form_data.password):
+        raise HTTPException(status_code=400, detail="Incorrect email or password")
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode = {"sub": str(user.id), "exp": expire}
+    token = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return {"access_token": token, "token_type": "bearer"}
+
+========================================
+camera.py
+========================================
+from fastapi import APIRouter, UploadFile, File
+from tasks.recognition_tasks import process_entry_camera
+import shutil
+import os
+import tempfile
+
+router = APIRouter()
+
+
+@router.post("/camera/entry")
+async def camera_entry(file: UploadFile = File(...)):
+    temp_dir = tempfile.gettempdir()
+    temp_path = os.path.join(temp_dir, f"parking_cam_{file.filename}")
+
+    with open(temp_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    task = process_entry_camera.delay(temp_path)
+    return {"task_id": task.id}
+
+========================================
+parking.py
+========================================
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+from sqlalchemy import and_
+from core.database import get_db
+from models.models import User, Vehicle, ParkingSpot, Tariff, ParkingSession, SessionStatus
+from schemas.schemas import StartParkingRequest, ParkingSessionOut
+from dependencies import get_current_user
+from tasks.parking_tasks import check_expiring_sessions
+import datetime
+
+router = APIRouter(prefix="/parking", tags=["parking"])
+
+@router.post("/start", response_model=ParkingSessionOut)
+async def start_parking_session(
+    request: StartParkingRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    vehicle = db.query(Vehicle).filter(
+        Vehicle.plate_number == request.plate_number
+    ).first()
+
+    if not vehicle:
+        vehicle = Vehicle(
+            user_id=current_user.id,
+            plate_number=request.plate_number.upper()
+        )
+        db.add(vehicle)
+        db.flush()
+    else:
+        if vehicle.user_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Автомобиль привязан к другому пользователю"
+            )
+
+    active_session = db.query(ParkingSession).filter(
+        and_(
+            ParkingSession.vehicle_id == vehicle.id,
+            ParkingSession.status == SessionStatus.active
+        )
+    ).first()
+    if active_session:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Для данного автомобиля уже есть активная сессия"
+        )
+
+    free_spot = db.query(ParkingSpot).filter(
+        ParkingSpot.status == "free"
+    ).first()
+    if not free_spot:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Нет свободных мест"
+        )
+
+    active_tariff = db.query(Tariff).filter(Tariff.is_active == True).first()
+    if not active_tariff:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Не настроены активные тарифы"
+        )
+
+    session = ParkingSession(
+        vehicle_id=vehicle.id,
+        spot_id=free_spot.id,
+        entry_time=datetime.datetime.utcnow(),
+        tariff_id=active_tariff.id,
+        status=SessionStatus.active
+    )
+    db.add(session)
+
+    free_spot.status = "occupied"
+    db.add(free_spot)
+
+    db.commit()
+    db.refresh(session)
+
+
+    return session
+
+========================================
+schemas.py
+========================================
+from pydantic import BaseModel, Field
+from datetime import datetime
+from typing import Optional
+
+class StartParkingRequest(BaseModel):
+    plate_number: str = Field(
+        ...,
+        pattern=r'^[АВЕКМНОРСТУХ]\d{3}[АВЕКМНОРСТУХ]{2}\d{2,3}$',
+        description="Госномер РФ (пример: А123БВ77)"
+    )
+
+class ParkingSessionOut(BaseModel):
+    id: int
+    vehicle_id: int
+    spot_id: int
+    entry_time: datetime
+    tariff_id: int
+    status: str
+
+    class Config:
+        orm_mode = True
+
+========================================
+notification_tasks.py
+========================================
+from celery import shared_task
+from core.database import SessionLocal
+from models.models import ParkingSession
+
+@shared_task
+def send_expiry_notification(session_id: int):
+    db = SessionLocal()
+    try:
+        session = db.query(ParkingSession).get(session_id)
+        if not session or session.status != "active":
+            return
+        user = session.vehicle.owner
+        if user and user.email:
+            print(f"Уведомление для {user.email}: время парковки истекает")
+    finally:
+        db.close()
+
+========================================
+parking_tasks.py
+========================================
+from celery import shared_task
+from core.database import SessionLocal
+from models.models import ParkingSession, ParkingSpot, SessionStatus, SpotStatus
+from sqlalchemy import and_
+from datetime import datetime, timedelta
+import logging
+
+logger = logging.getLogger(__name__)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+@shared_task(bind=True, max_retries=3)
+def check_expiring_sessions(self):
+    db = next(get_db())
+    try:
+        now = datetime.utcnow()
+        warning_time = now + timedelta(minutes=10)
+        sessions = db.query(ParkingSession).filter(
+            ParkingSession.status == SessionStatus.active
+        ).all()
+
+        for session in sessions:
+            if (now - session.entry_time).total_seconds() > 3600:
+                from tasks.notification_tasks import send_expiry_notification
+                send_expiry_notification.delay(session.id)
+        db.commit()
+    except Exception as e:
+        logger.error(f"Error in check_expiring_sessions: {e}")
+        raise self.retry(exc=e, countdown=60)
+    finally:
+        db.close()
+
+@shared_task
+def sync_sensor_data():
+    db = next(get_db())
+    try:
+        spots = db.query(ParkingSpot).filter(ParkingSpot.sensor_id.isnot(None)).all()
+        db.commit()
+    finally:
+        db.close()
+
+@shared_task
+def cleanup_stale_sessions():
+    db = next(get_db())
+    try:
+        stale_time = datetime.utcnow() - timedelta(hours=24)
+        stale_sessions = db.query(ParkingSession).filter(
+            and_(
+                ParkingSession.status == SessionStatus.active,
+                ParkingSession.entry_time < stale_time
+            )
+        ).all()
+        for session in stale_sessions:
+            session.status = SessionStatus.completed
+            session.exit_time = datetime.utcnow()
+            spot = session.spot
+            if spot:
+                spot.status = SpotStatus.free
+            tariff = session.tariff
+            session.total_cost = tariff.max_daily or (tariff.price_per_minute * 24 * 60)
+        db.commit()
+        logger.info(f"Cleaned up {len(stale_sessions)} stale sessions")
+    finally:
+        db.close()
+
+========================================
+recognition_tasks.py
+========================================
+from celery import shared_task
+from license_plate.recognizer import LicensePlateRecognizer
+from core.database import SessionLocal
+from models.models import ParkingSession, Vehicle, ParkingSpot, Tariff, SessionStatus, SpotStatus
+from datetime import datetime
+import logging
+
+logger = logging.getLogger(__name__)
+
+recognizer = None
+
+def get_recognizer():
+    global recognizer
+    if recognizer is None:
+        recognizer = LicensePlateRecognizer()
+    return recognizer
+
+@shared_task(bind=True, max_retries=2)
+def process_entry_camera(self, image_path: str, spot_id: int = None):
+    rec = get_recognizer()
+    result = rec.run(image_path)
+    logger.info(f"Результат распознавания: {result}")
+
+    if not result["success"]:
+        return {"status": "failed", "reason": result.get("error", "Recognition failed")}
+
+    plate = result["plate"]
+    confidence = result["confidence"]
+    is_valid = result["valid_format"]
+
+    if not is_valid and len(plate) >= 6:
+        logger.warning(f"Номер не прошёл валидацию, но принят для теста: {plate} (уверенность {confidence})")
+        is_valid = True
+
+    if not is_valid:
+        return {"status": "failed", "reason": f"Invalid plate: {plate} (conf: {confidence})"}
+
+    db = SessionLocal()
+    try:
+        vehicle = db.query(Vehicle).filter(Vehicle.plate_number == plate).first()
+        if not vehicle:
+            vehicle = Vehicle(plate_number=plate)
+            db.add(vehicle)
+            db.flush()
+
+        active = db.query(ParkingSession).filter(
+            ParkingSession.vehicle_id == vehicle.id,
+            ParkingSession.status == SessionStatus.active
+        ).first()
+        if active:
+            db.close()
+            return {"status": "skipped", "reason": "Active session exists"}
+
+        if spot_id:
+            spot = db.query(ParkingSpot).get(spot_id)
+            if not spot or spot.status != SpotStatus.free:
+                db.close()
+                return {"status": "failed", "reason": "Spot not free"}
+        else:
+            spot = db.query(ParkingSpot).filter(ParkingSpot.status == SpotStatus.free).first()
+        if not spot:
+            db.close()
+            return {"status": "failed", "reason": "No free spots"}
+
+        tariff = db.query(Tariff).filter(Tariff.is_active == True).first()
+        session = ParkingSession(
+            vehicle_id=vehicle.id,
+            spot_id=spot.id,
+            entry_time=datetime.utcnow(),
+            tariff_id=tariff.id if tariff else None,
+            status=SessionStatus.active
+        )
+        db.add(session)
+        spot.status = SpotStatus.occupied
+        db.commit()
+
+        return {"status": "success", "session_id": session.id, "plate": plate}
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Ошибка в process_entry_camera: {e}")
+        return {"status": "failed", "reason": str(e)}
+    finally:
+        db.close()
+
+========================================
+report_tasks.py
+========================================
+from celery import shared_task
+from core.database import SessionLocal
+import pandas as pd
+from datetime import datetime, timedelta
+from models.models import ParkingSession
+import os
+
+@shared_task
+def generate_daily_report():
+    db = SessionLocal()
+    try:
+        yesterday = datetime.utcnow().date() - timedelta(days=1)
+        start = datetime(yesterday.year, yesterday.month, yesterday.day)
+        end = start + timedelta(days=1)
+
+        sessions = db.query(ParkingSession).filter(
+            ParkingSession.exit_time >= start,
+            ParkingSession.exit_time < end,
+            ParkingSession.status == "completed"
+        ).all()
+
+        data = []
+        for s in sessions:
+            data.append({
+                "session_id": s.id,
+                "vehicle": s.vehicle.plate_number,
+                "entry": s.entry_time,
+                "exit": s.exit_time,
+                "duration_min": (s.exit_time - s.entry_time).total_seconds() / 60 if s.exit_time else 0,
+                "cost": s.total_cost
+            })
+        df = pd.DataFrame(data)
+
+        os.makedirs("reports", exist_ok=True)
+        filename = f"reports/daily_{yesterday.strftime('%Y%m%d')}.csv"
+        df.to_csv(filename, index=False)
+
+        return {"status": "ok", "file": filename}
+    finally:
+        db.close()
+
+========================================
+dependencies.py
+========================================
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jose import JWTError, jwt
+from sqlalchemy.orm import Session
+from core.database import get_db
+from models.models import User
+
+security = HTTPBearer()
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db)
+) -> User:
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token, "SECRET_KEY", algorithms=["HS256"])
+        user_id: int = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user = db.query(User).get(user_id)
+    if user is None:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+========================================
+main.py
+========================================
+from fastapi import FastAPI
+from routers import parking, camera, auth
+from core.celery_app import celery_app
+
+app = FastAPI(title="Parking System")
+
+app.include_router(auth.router)
+app.include_router(parking.router)
+app.include_router(camera.router)
+
+@app.on_event("startup")
+async def startup_event():
+    print("Приложение запущено")
+
+@app.get("/task/check-expiring")
+async def trigger_check_expiring():
+    task = celery_app.send_task("tasks.parking_tasks.check_expiring_sessions")
+    return {"task_id": task.id}

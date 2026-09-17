@@ -28,7 +28,6 @@ def process_entry_camera(self, image_path: str, spot_id: int = None):
     confidence = result["confidence"]
     is_valid = result["valid_format"]
 
-    # Если формат не совпадает, но номер длинный, примем для теста
     if not is_valid and len(plate) >= 6:
         logger.warning(f"Номер не прошёл валидацию, но принят для теста: {plate} (уверенность {confidence})")
         is_valid = True
@@ -40,12 +39,10 @@ def process_entry_camera(self, image_path: str, spot_id: int = None):
     try:
         vehicle = db.query(Vehicle).filter(Vehicle.plate_number == plate).first()
         if not vehicle:
-            # Создаём автомобиль без владельца (user_id=None)
             vehicle = Vehicle(plate_number=plate)
             db.add(vehicle)
-            db.flush()  # чтобы получить id
+            db.flush()
 
-        # Проверка активной сессии
         active = db.query(ParkingSession).filter(
             ParkingSession.vehicle_id == vehicle.id,
             ParkingSession.status == SessionStatus.active
@@ -54,7 +51,6 @@ def process_entry_camera(self, image_path: str, spot_id: int = None):
             db.close()
             return {"status": "skipped", "reason": "Active session exists"}
 
-        # Поиск свободного места
         if spot_id:
             spot = db.query(ParkingSpot).get(spot_id)
             if not spot or spot.status != SpotStatus.free:

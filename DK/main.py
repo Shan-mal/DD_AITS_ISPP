@@ -10,7 +10,6 @@ app.include_router(camera.router)
 
 @app.on_event("startup")
 async def startup_event():
-    # При необходимости можно проверить соединение с Redis и т.п.
     print("Приложение запущено")
 
 @app.get("/task/check-expiring")
